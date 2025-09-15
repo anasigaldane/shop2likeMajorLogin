@@ -1,9 +1,29 @@
 {
+  "version": 2,
   "builds": [
-    { "src": "app.py", "use": "@vercel/python" }
+    {
+      "src": "app.py",
+      "use": "@vercel/python",
+      "config": {
+        "maxLambdaSize": "50mb",
+        "runtime": "python3.11"
+      }
+    }
   ],
   "routes": [
-    { "src": "/(.*)", "dest": "app.py" }
+    {
+      "src": "/(.*)",
+      "dest": "app.py"
+    }
   ],
-  "regions": ["sin1"]
+  "env": {
+    "MAIN_KEY_BASE64": "@main_key_base64",
+    "MAIN_IV_BASE64": "@main_iv_base64",
+    "RELEASE_VERSION": "OB50",
+    "USER_AGENT": "Dalvik/2.1.0 (Linux; U; Android 13)",
+    "ACCOUNT_CREDENTIALS_JSON": "@account_credentials_json",
+    "TOKEN_TTL": "25200",
+    "INSTANCE_CONCURRENCY": "200",
+    "REDIS_URL": "@redis_url"
+  }
 }
