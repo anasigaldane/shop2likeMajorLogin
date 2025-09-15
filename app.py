@@ -6,13 +6,11 @@ import json
 import logging
 import base64
 from collections import defaultdict
-from functools import wraps
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from cachetools import TTLCache
-from typing import Tuple, Callable
+from typing import Tuple
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import JSONResponse
 from proto import FreeFire_pb2, main_pb2, AccountPersonalShow_pb2
-from google.protobuf import json_format, message
+from google.protobuf import json_format
 from google.protobuf.message import Message
 from Crypto.Cipher import AES
 
@@ -23,20 +21,15 @@ RELEASEVERSION = "OB50"
 USERAGENT = "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)"
 SUPPORTED_REGIONS = {"IND", "BR", "US", "SAC", "NA", "SG", "RU", "ID", "TW", "VN", "TH", "ME", "PK", "CIS", "BD", "EUROPE"}
 TOKEN_TTL = 25200  # 7 hours
-MAX_RETRIES = 3
 REQUEST_TIMEOUT = 10
 
 # =================== LOGGING ===================
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[logging.FileHandler("app.log"), logging.StreamHandler()]
+    format='%(asctime)s [%(levelname)s] %(message)s'
 )
 
-# =================== FLASK APP ===================
-app = Flask(__name__)
-CORS(app)
-cache = TTLCache(maxsize=100, ttl=300)
+# =================== GLOBALS ===================
 cached_tokens = defaultdict(dict)
 
 # =================== CRYPTO HELPERS ===================
@@ -59,24 +52,7 @@ async def json_to_proto(json_data: str, proto_message: Message) -> bytes:
     return proto_message.SerializeToString()
 
 # =================== UTILS ===================
-def retry_async(max_retries: int = MAX_RETRIES):
-    """Decorator for retrying async functions with exceptions."""
-    def decorator(func: Callable):
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            for attempt in range(1, max_retries + 1):
-                try:
-                    return await func(*args, **kwargs)
-                except Exception as e:
-                    logging.warning(f"Attempt {attempt} failed for {func.__name__}: {e}")
-                    if attempt == max_retries:
-                        raise
-                    await asyncio.sleep(1)
-        return wrapper
-    return decorator
-
 def safe_get(d: dict, keys: list, default=None):
-    """Recursively get nested keys safely."""
     for key in keys:
         if isinstance(d, dict):
             d = d.get(key, default)
@@ -96,20 +72,16 @@ def get_account_credentials(region: str) -> str:
     else:
         return "uid=4167202140&password=7F6CDF48F387A1D78010CB3359A3660BCFC5AA0040A0118D0287122973DD1FE3"
 
-# =================== HTTP CLIENT ===================
-http_client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
-
 # =================== TOKEN MANAGEMENT ===================
-@retry_async()
 async def get_access_token(account: str) -> Tuple[str, str]:
     url = "https://ffmconnect.live.gop.garenanow.com/oauth/guest/token/grant"
     payload = account + "&response_type=token&client_type=2&client_secret=2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3&client_id=100067"
     headers = {'User-Agent': USERAGENT, 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip", 'Content-Type': "application/x-www-form-urlencoded"}
-    resp = await http_client.post(url, data=payload, headers=headers)
-    data = resp.json()
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        resp = await client.post(url, data=payload, headers=headers)
+        data = resp.json()
     return data.get("access_token", "0"), data.get("open_id", "0")
 
-@retry_async()
 async def create_jwt(region: str):
     account = get_account_credentials(region)
     token_val, open_id = await get_access_token(account)
@@ -127,7 +99,8 @@ async def create_jwt(region: str):
         'X-GA': "v1 1",
         'ReleaseVersion': RELEASEVERSION
     }
-    resp = await http_client.post(url, data=payload, headers=headers)
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        resp = await client.post(url, data=payload, headers=headers)
     msg = json.loads(json_format.MessageToJson(decode_protobuf(resp.content, FreeFire_pb2.LoginRes)))
     cached_tokens[region] = {
         'token': f"Bearer {msg.get('token','0')}",
@@ -136,16 +109,6 @@ async def create_jwt(region: str):
         'expires_at': time.time() + TOKEN_TTL
     }
     logging.info(f"JWT created for region {region}")
-
-async def initialize_tokens():
-    tasks = [create_jwt(r) for r in SUPPORTED_REGIONS]
-    await asyncio.gather(*tasks)
-
-async def refresh_tokens_periodically():
-    while True:
-        await asyncio.sleep(TOKEN_TTL)
-        logging.info("Refreshing all tokens...")
-        await initialize_tokens()
 
 async def get_token_info(region: str) -> Tuple[str, str, str]:
     info = cached_tokens.get(region)
@@ -156,7 +119,6 @@ async def get_token_info(region: str) -> Tuple[str, str, str]:
     return info['token'], info['region'], info['server_url']
 
 # =================== API INTERACTIONS ===================
-@retry_async()
 async def GetAccountInformation(uid, unk, region, endpoint):
     region = region.upper()
     if region not in SUPPORTED_REGIONS:
@@ -175,7 +137,8 @@ async def GetAccountInformation(uid, unk, region, endpoint):
         'X-GA': "v1 1",
         'ReleaseVersion': RELEASEVERSION
     }
-    resp = await http_client.post(server + endpoint, data=data_enc, headers=headers)
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        resp = await client.post(server + endpoint, data=data_enc, headers=headers)
     return json.loads(json_format.MessageToJson(decode_protobuf(resp.content, AccountPersonalShow_pb2.AccountPersonalShowInfo)))
 
 # =================== RESPONSE FORMATTING ===================
@@ -223,36 +186,25 @@ def format_response(data):
         "socialinfo": safe_get(data, ["socialInfo"], {})
     }
 
-# =================== API ROUTES ===================
-@app.route('/player-info')
-def get_account_info():
-    region = request.args.get('region')
-    uid = request.args.get('uid')
-    if not uid or not region:
-        return jsonify({"error": "Please provide UID and REGION."}), 400
+# =================== FASTAPI APP ===================
+app = FastAPI()
+
+@app.get("/player-info")
+async def get_player_info(uid: str = Query(...), region: str = Query(...)):
     try:
-        return_data = asyncio.run(GetAccountInformation(uid, "7", region, "/GetPlayerPersonalShow"))
-        formatted = format_response(return_data)
-        return jsonify(formatted), 200
+        data = await GetAccountInformation(uid, "7", region, "/GetPlayerPersonalShow")
+        formatted = format_response(data)
+        return JSONResponse(formatted)
     except Exception as e:
         logging.error(f"Failed to fetch account info: {e}")
-        return jsonify({"error": "Invalid UID or Region. Please check and try again."}), 500
+        raise HTTPException(status_code=500, detail="Invalid UID or Region. Please check and try again.")
 
-@app.route('/refresh', methods=['GET', 'POST'])
-def refresh_tokens_endpoint():
+@app.get("/refresh")
+async def refresh_tokens():
     try:
-        asyncio.run(initialize_tokens())
-        return jsonify({'message': 'Tokens refreshed for all regions.'}), 200
+        tasks = [create_jwt(r) for r in SUPPORTED_REGIONS]
+        await asyncio.gather(*tasks)
+        return {"message": "Tokens refreshed for all regions."}
     except Exception as e:
         logging.error(f"Failed to refresh tokens: {e}")
-        return jsonify({'error': f'Refresh failed: {e}'}), 500
-
-# =================== STARTUP ===================
-async def startup():
-    logging.info("Initializing tokens...")
-    await initialize_tokens()
-    asyncio.create_task(refresh_tokens_periodically())
-
-if __name__ == '__main__':
-    asyncio.run(startup())
-    app.run(host='0.0.0.0', port=5000, debug=False)
+        raise HTTPException(status_code=500, detail=f"Refresh failed: {e}")
