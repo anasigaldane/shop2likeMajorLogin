@@ -5,7 +5,6 @@ import time
 import base64
 import json
 from typing import Tuple, Optional
-from functools import wraps
 
 import httpx
 import aioredis
@@ -15,7 +14,6 @@ from pydantic import BaseModel, constr
 from cachetools import TTLCache
 from Crypto.Cipher import AES
 from google.protobuf import json_format, message
-from google.protobuf.message import Message
 import logging
 
 # -----------------------
@@ -25,16 +23,28 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("ff_service")
 
 # -----------------------
-# ENV VARS (set securely)
+# ENV VARS
 # -----------------------
-MAIN_KEY = base64.b64decode(os.getenv("MAIN_KEY_BASE64", ""))
-MAIN_IV = base64.b64decode(os.getenv("MAIN_IV_BASE64", ""))
+MAIN_KEY_B64 = os.getenv("MAIN_KEY_BASE64", "WWcmdGMlREV1aDYlWmNeOA")
+MAIN_IV_B64 = os.getenv("MAIN_IV_BASE64", "Nm95WkRyMjJFM3ljaGpNJQ")
 RELEASEVERSION = os.getenv("RELEASE_VERSION", "OB50")
 USERAGENT = os.getenv("USER_AGENT", "Dalvik/2.1.0 (Linux; U; Android 13)")
 REDIS_URL = os.getenv("REDIS_URL", None)
-ACCOUNT_CREDENTIALS = json.loads(os.getenv("ACCOUNT_CREDENTIALS_JSON", "{}"))
+ACCOUNT_CREDENTIALS = json.loads(os.getenv("ACCOUNT_CREDENTIALS_JSON", "{DEFAULT":"uid=4167202140&password=7F6CDF48F387A1D78010CB3359A3660BCFC5AA0040A0118D0287122973DD1FE3}"))
 SUPPORTED_REGIONS = set(os.getenv("SUPPORTED_REGIONS",
-                                 "IND,BR,US,SAC,NA,SG,RU,ID,TW,VN,TH,ME,PK,CIS,BD,EUROPE").split(","))
+    "IND,BR,US,SAC,NA,SG,RU,ID,TW,VN,TH,ME,PK,CIS,BD,EUROPE").split(","))
+
+# Decode keys
+try:
+    MAIN_KEY = base64.b64decode(MAIN_KEY_B64)
+    MAIN_IV = base64.b64decode(MAIN_IV_B64)
+except Exception:
+    MAIN_KEY = b''
+    MAIN_IV = b''
+    logger.error("Failed to decode MAIN_KEY or MAIN_IV from Base64")
+
+if len(MAIN_KEY) not in (16, 24, 32) or len(MAIN_IV) != 16:
+    logger.warning("Invalid AES key/IV length. AES encryption will fail.")
 
 # -----------------------
 # Proto imports (ensure proto package is on PYTHONPATH)
@@ -60,6 +70,8 @@ def pad(data: bytes) -> bytes:
     return data + bytes([pad_len]) * pad_len
 
 def aes_cbc_encrypt(key: bytes, iv: bytes, plaintext: bytes) -> bytes:
+    if not key or not iv or len(key) not in (16, 24, 32) or len(iv) != 16:
+        raise ValueError("Invalid AES key or IV")
     cipher = AES.new(key, AES.MODE_CBC, iv)
     return cipher.encrypt(pad(plaintext))
 
@@ -74,7 +86,7 @@ def decode_protobuf(encoded: bytes, message_type: message.Message) -> message.Me
         raise ValueError(f"Protobuf parse error: {e}")
     return inst
 
-async def json_to_proto(json_data: str, proto_message: Message) -> bytes:
+async def json_to_proto(json_data: str, proto_message: message.Message) -> bytes:
     inst = proto_message
     try:
         json_format.ParseDict(json.loads(json_data), inst)
@@ -88,20 +100,31 @@ async def json_to_proto(json_data: str, proto_message: Message) -> bytes:
 async def redis_connect():
     global redis
     if not REDIS_URL:
-        logger.warning("REDIS_URL not configured, using local in-memory cache only")
+        logger.info("REDIS_URL not configured, using local in-memory cache only")
         return None
-    redis = await aioredis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
-    logger.info("Connected to Redis")
-    return redis
+    try:
+        redis = await aioredis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
+        logger.info("Connected to Redis")
+        return redis
+    except Exception as e:
+        logger.warning("Cannot connect to Redis: %s. Using local cache.", e)
+        return None
 
 async def cache_get(key: str):
     if redis:
-        return await redis.get(key)
+        try:
+            return await redis.get(key)
+        except Exception as e:
+            logger.warning("Redis GET failed: %s", e)
     return local_cache.get(key)
 
 async def cache_set(key: str, value: str, ttl: int):
     if redis:
-        await redis.set(key, value, ex=ttl)
+        try:
+            await redis.set(key, value, ex=ttl)
+        except Exception as e:
+            logger.warning("Redis SET failed: %s", e)
+            local_cache[key] = value
     else:
         local_cache[key] = value
 
@@ -164,21 +187,36 @@ async def create_jwt_and_cache(region: str):
         if not account:
             raise ValueError("No credentials configured for region")
 
+        logger.info("Obtaining token for region %s", region)
         token_val, open_id = await obtain_access_token_for_account(account)
-        body = json.dumps({"open_id": open_id, "open_id_type": "4", "login_token": token_val, "orign_platform_type": "4"})
+
+        body = json.dumps({
+            "open_id": open_id,
+            "open_id_type": "4",
+            "login_token": token_val,
+            "orign_platform_type": "4"
+        })
+
         proto_bytes = await json_to_proto(body, FreeFire_pb2.LoginReq())
         payload = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, proto_bytes)
+
         url = "https://loginbp.ggblueshark.com/MajorLogin"
         headers = {
-            'User-Agent': USERAGENT, 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip",
-            'Content-Type': "application/octet-stream", 'Expect': "100-continue",
-            'X-Unity-Version': "2018.4.11f1", 'X-GA': "v1 1", 'ReleaseVersion': RELEASEVERSION
+            'User-Agent': USERAGENT,
+            'Connection': "Keep-Alive",
+            'Accept-Encoding': "gzip",
+            'Content-Type': "application/octet-stream",
+            'Expect': "100-continue",
+            'X-Unity-Version': "2018.4.11f1",
+            'X-GA': "v1 1",
+            'ReleaseVersion': RELEASEVERSION
         }
+
         resp = await post_with_retries(url, data=payload, headers=headers, retries=3)
-        try:
-            msg_json = json.loads(json_format.MessageToJson(decode_protobuf(resp.content, FreeFire_pb2.LoginRes)))
-        except Exception as e:
-            raise ValueError("Failed to parse login response") from e
+        if not resp.content:
+            raise HTTPException(status_code=502, detail="Empty response from MajorLogin server")
+
+        msg_json = json.loads(json_format.MessageToJson(decode_protobuf(resp.content, FreeFire_pb2.LoginRes)))
 
         stored = {
             'token': f"Bearer {msg_json.get('token','0')}",
@@ -186,10 +224,14 @@ async def create_jwt_and_cache(region: str):
             'server_url': msg_json.get('serverUrl','0'),
             'expires_at': time.time() + TOKEN_TTL - 30
         }
+
         await cache_set(f"token:{region}", json.dumps(stored), TOKEN_TTL)
         logger.info("Cached token for region %s", region)
         return stored
 
+# -----------------------
+# Get token info
+# -----------------------
 async def get_token_info(region: str):
     raw = await cache_get(f"token:{region}")
     if raw:
@@ -218,21 +260,24 @@ async def GetAccountInformation(uid: str, unk: str, region: str, endpoint: str):
         raise HTTPException(status_code=502, detail="No server URL returned from login")
 
     headers = {
-        'User-Agent': USERAGENT, 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip",
-        'Content-Type': "application/octet-stream", 'Expect': "100-continue",
-        'Authorization': token, 'X-Unity-Version': "2018.4.11f1", 'X-GA': "v1 1",
+        'User-Agent': USERAGENT,
+        'Connection': "Keep-Alive",
+        'Accept-Encoding': "gzip",
+        'Content-Type': "application/octet-stream",
+        'Expect': "100-continue",
+        'Authorization': token,
+        'X-Unity-Version': "2018.4.11f1",
+        'X-GA': "v1 1",
         'ReleaseVersion': RELEASEVERSION
     }
 
     async with SEMAPHORE:
         resp = await post_with_retries(server + endpoint, data=data_enc, headers=headers, retries=3)
 
-    try:
-        parsed = json.loads(json_format.MessageToJson(decode_protobuf(resp.content, AccountPersonalShow_pb2.AccountPersonalShowInfo)))
-    except Exception as e:
-        logger.exception("Failed to decode account info")
-        raise HTTPException(status_code=502, detail=f"Failed to decode server response: {e}")
+    if not resp.content:
+        raise HTTPException(status_code=502, detail="Empty response from GetPlayerPersonalShow server")
 
+    parsed = json.loads(json_format.MessageToJson(decode_protobuf(resp.content, AccountPersonalShow_pb2.AccountPersonalShowInfo)))
     return parsed
 
 # -----------------------
@@ -307,15 +352,6 @@ async def shutdown_event():
     if redis:
         await redis.close()
     logger.info("Service shutdown complete")
-
-@app.middleware("http")
-async def add_process_time_header(request: Request, call_next):
-    # simple IP rate-limiter hook can be added here if desired
-    start = time.time()
-    response = await call_next(request)
-    process_time = time.time() - start
-    response.headers["X-Process-Time"] = str(process_time)
-    return response
 
 @app.get("/player-info")
 async def get_account_info(uid: str = Query(...), region: str = Query(...)):
